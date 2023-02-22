@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+import os
+import re
+import subprocess as sp
+import textwrap
+
+ATTR_RE = re.compile("([a-zA-Z][a-zA-Z\-]*):\s+(.*)")
+VCPKG_CONFIG = "vcpkg-configuration.json"
+VERSION_TYPES = [
+    "version",
+    "version-semver",
+    "version-date",
+    "version-string"
+]
+
+def parse_args():
+    description = "Freeze the set of installed vcpkg ports"
+    parser = argparse.ArgumentParser(description = description)
+    parser.add_argument("--repo",
+        default = os.getenv("VCPKG_ROOT", "~/vcpkg"),
+        help = "Path to vcpkg"
+    )
+    parser.add_argument("--status-file",
+        default = "./vcpkg_installed/vcpkg/status",
+        help = "Path to your installed vcpkg status file"
+    )
+    parser.add_argument("--freeze-directory",
+        default = "./.vcpkg-freeze",
+        help = "Directory to store your frozen registry"
+    )
+    return parser.parse_args()
+
+def load_json(fname):
+    if not os.path.exists(fname):
+        print("File not found: {}".format(fname))
+        exit(2)
+    with open(fname) as handle:
+        return json.load(handle)
+
+def parse_port(lines):
+    ret = {}
+    key = None
+    for line in lines:
+        match = ATTR_RE.match(line)
+        if not match:
+            assert key is not None
+            ret[key] += line
+            continue
+        key = match.group(1).lower()
+        val = match.group(2)
+        ret[key] = val
+    if "port-version" in ret:
+        ret["port-version"] = int(ret["port-version"])
+    return ret
+
+def parse_ports(fh):
+    curr_port = []
+    for line in fh:
+        line = line.strip()
+        if not line and curr_port:
+            yield parse_port(curr_port)
+            curr_port = []
+        else:
+            curr_port.append(line)
+    if curr_port:
+        yield parse_port(curr_port)
+
+def load_ports(args):
+    if not os.path.isfile(args.status_file):
+        print("File not found: {}".format(args.status_file))
+        exit(1)
+    with open(args.status_file) as handle:
+        yield from parse_ports(handle)
+
+def git_copy(args, port, hash, dst_dir):
+    cmd = [
+        "/usr/bin/git",
+        "-C",
+        args.repo,
+        "cat-file",
+        "-p",
+        hash
+    ]
+    fs_entries = set()
+    stdout = sp.check_output(cmd).decode("utf-8")
+    for line in stdout.splitlines():
+        bits = line.split()
+        fs_entries.add(bits[3])
+        if bits[1] == "tree":
+            new_dst = os.path.join(dst_dir, bits[3])
+            os.makedirs(new_dst, exist_ok=True)
+            git_copy(args, port, bits[2], new_dst)
+        elif bits[1] == "blob":
+            fname = os.path.join(dst_dir, bits[3])
+            with open(fname, "w") as handle:
+                cmd = [
+                    "/usr/bin/git",
+                    "-C",
+                    args.repo,
+                    "cat-file",
+                    "-p",
+                    bits[2]
+                ]
+                sp.check_call(cmd, stdout=handle)
+    for entry in os.listdir(dst_dir):
+        if entry in (".", ".."):
+            continue
+        if entry not in fs_entries:
+            path = os.path.join(dst_dir, entry)
+            print("Extra file exists: {}".format(path))
+            msg = textwrap.dedent("""\
+                I am too cowardly to delete your files. Please delete
+                this file to continue freezing ports.""")
+            print(msg)
+            exit(2)
+
+def write_versions(args, port):
+    data = {"versions": [{
+        port["version-type"]: port["version"],
+        "port-version": port.get("port-version", 0),
+        "path": port["rel-path"]
+    }]}
+    os.makedirs(os.path.dirname(port["versions-path"]), exist_ok=True)
+    with open(port["versions-path"], "w") as handle:
+        json.dump(data, handle, sort_keys=True, indent=2)
+
+def freeze_port(args, port):
+    if "version" not in port:
+        # For some reason, features get their own port entry?
+        assert "feature" in port, "Invalid port"
+        return False
+    if "install" not in port["status"]:
+        msg = "Skipping port not marked for isntallation: {}"
+        print(msg.format(port["package"]))
+        return False
+    versions_path = os.path.join(
+        os.path.expanduser(args.repo),
+        "versions",
+        "{}-".format(port["package"][0]),
+        "{}.json".format(port["package"])
+    )
+    versions = load_json(versions_path)
+    for vsn in versions["versions"]:
+        for vtype in VERSION_TYPES:
+            if vsn.get(vtype) != port["version"]:
+                continue
+            if vsn["port-version"] != port.get("port-version", 0):
+                continue
+            port["version-type"] = vtype
+            port["git-tree"] = vsn["git-tree"]
+            break
+    assert "version-type" in port, "Error finding version info to freeze"
+
+    if port.get("port-version"):
+        path_vsn = "{}_{}".format(port["version"], port["port-version"])
+    else:
+        path_vsn = port["version"]
+    port["path"] = os.path.join(
+        os.path.expanduser(args.freeze_directory),
+        "ports",
+        port["package"],
+        path_vsn
+    )
+    port["rel-path"] = os.path.join("$/ports", port["package"], path_vsn)
+    # Note this is not the same as versions_path above, as that
+    # is the path to the vcpkg port versions file, not our frozen
+    # registry.
+    port["versions-path"] = os.path.join(
+        os.path.expanduser(args.freeze_directory),
+        "versions",
+        "{}-".format(port["package"][0]),
+        "{}.json".format(port["package"])
+    )
+    os.makedirs(port["path"], exist_ok=True)
+    git_copy(args, port, port["git-tree"], port["path"])
+    write_versions(args, port)
+    return True
+
+def write_baseline(args, ports):
+    baseline_path = os.path.join(
+        os.path.expanduser(args.freeze_directory),
+        "versions",
+        "baseline.json"
+    )
+    data = {}
+    for port in ports:
+        data[port["package"]] = {
+            "baseline": port["version"],
+            "port-version": port.get("port-version", 0)
+        }
+    data = {"default": data}
+    with open(baseline_path, "w") as handle:
+        json.dump(data, handle, sort_keys=True, indent=2)
+
+def write_vcpkg_config(args):
+    new_default = {
+        "kind": "filesystem",
+        "path": args.freeze_directory
+    }
+    data = {}
+    if os.path.isfile(VCPKG_CONFIG):
+        data = load_json(VCPKG_CONFIG)
+    if "default-registry" in data:
+        if data["default-registry"] != new_default:
+            msg = textwrap.dedent("""\
+                There's a non-frozen default-registry present in your
+                `vcpkg-configuration.json` which may prevent the frozen
+                registry from working correctly.
+                """)
+            print(msg)
+        else:
+            # Frozen registry already set
+            return
+    data["default-registry"] = new_default
+    with open(VCPKG_CONFIG, "w") as handle:
+        json.dump(data, handle, sort_keys=True, indent=2)
+
+def main():
+    args = parse_args()
+    ports = []
+    for port in load_ports(args):
+        if freeze_port(args, port):
+            ports.append(port)
+    write_baseline(args, ports)
+    write_vcpkg_config(args)
+
+if __name__ == "__main__":
+    main()
