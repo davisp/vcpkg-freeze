@@ -16,3 +16,9 @@ vcpkg-freeze
 ```
 
 Its important to note that if your project has optional features you should specify all features to `vcpkg install` with `--x-feature` flags so that all required ports are frozen.
+
+To Do
+---
+
+This won't work if packages are installed from a non-default registry. It
+would be nice to support those eventually.
